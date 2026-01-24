@@ -1,0 +1,8 @@
+{
+  "migrations": [
+    {
+      "bq_table": "seismic-helper-364013.vision_lookup.accounts"
+    }
+  ],
+  "batch_size": 1000
+}
