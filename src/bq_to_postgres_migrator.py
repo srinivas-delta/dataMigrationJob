@@ -1,6 +1,6 @@
 import traceback
 import json
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from datetime import datetime
 import time
 from functools import wraps
@@ -17,6 +17,7 @@ from .type_mappings import (
     is_binary_type,
     get_all_supported_types,
 )
+from .schema_drift_handler import SchemaDriftHandler, SchemaDriftReport
 
 
 def retry_with_exponential_backoff(max_retries: int = 3, initial_delay: float = 1.0):
@@ -66,11 +67,20 @@ class BQTypeMapper:
 class BQToPostgresMigrator:
     """Handles migration of tables from BigQuery to PostgreSQL"""
     
-    def __init__(self, bq_table_ref: str, gcp_credentials: Any, pg_connection_string: str):
+    def __init__(
+        self,
+        bq_table_ref: str,
+        gcp_credentials: Any,
+        pg_connection_string: str,
+        primary_key: str = "id",
+        removed_policy: str = "keep",
+    ):
         self.bq_table_ref = bq_table_ref
         self.project, self.dataset, self.table = self._parse_table_ref(bq_table_ref)
         self.gcp_credentials = gcp_credentials
-        
+        self.primary_key = primary_key
+        self.removed_policy = removed_policy  # keep | nullify | drop
+
         # Create engine with optimized connection pooling
         # pool_size: number of connections to keep in pool
         # max_overflow: number of additional connections beyond pool_size
@@ -83,10 +93,10 @@ class BQToPostgresMigrator:
             pool_pre_ping=True,
             pool_recycle=3600  # Recycle connections after 1 hour
         )
-        
+
         self.bq_client = None
         self.pg_table_name = self.table.lower()
-        
+
         # Pre-compute column placeholders for faster batch inserts
         self._column_placeholder_cache = {}
         
@@ -321,7 +331,7 @@ class BQToPostgresMigrator:
                         print(f"  ❌ Final batch {batch_num} FAILED after retries: {str(batch_error)[:100]}")
                 
                 conversion_time_total = time.perf_counter() - conversion_start - insert_time_total
-                conn.commit()
+                conn.connection.commit()
             
             total_time = time.perf_counter() - total_start
             
@@ -434,6 +444,460 @@ class BQToPostgresMigrator:
                 raise
 
     
+    # ------------------------------------------------------------------
+    # Safe incremental migrate (drift-aware, no truncate, upsert)
+    # ------------------------------------------------------------------
+
+    def migrate_safe(
+        self,
+        batch_size: int = 1000,
+        watermark_col: Optional[str] = None,
+        watermark_value: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Drift-aware, live-safe migration:
+          1. Detect schema changes (add/remove/type) between BQ and PG
+          2. Apply non-destructive DDL (ALTER TABLE ADD/DROP COLUMN)
+          3. Upsert only changed rows using ON CONFLICT (primary_key) DO UPDATE
+
+        Parameters
+        ----------
+        batch_size      : Rows per upsert batch
+        watermark_col   : BQ timestamp column to filter delta rows (e.g. 'updated_at')
+        watermark_value : ISO timestamp string; only rows newer than this are fetched
+        """
+        print(f"\n{'='*60}")
+        print(f"[SAFE] Migration: {self.bq_table_ref} → {self.pg_table_name}")
+        if watermark_col and watermark_value:
+            print(f"       Incremental: {watermark_col} > {watermark_value}")
+        print(f"{'='*60}\n")
+
+        start_time = datetime.now()
+
+        try:
+            # Step 1: BQ schema
+            print("📋 Step 1: Fetching BigQuery schema...")
+            schema = self.get_bq_table_schema()
+            print(f"   Found {len(schema)} columns in BQ")
+
+            # Step 2: Schema drift detection + DDL apply
+            print("\n🔍 Step 2: Detecting schema drift...")
+            drift_handler = SchemaDriftHandler(
+                pg_engine=self.pg_engine,
+                pg_table_name=self.pg_table_name,
+                removed_policy=self.removed_policy,
+            )
+            drift_report = drift_handler.detect_and_apply(schema)
+            print(drift_report.summary())
+
+            # Step 3: Create table if it didn't exist
+            if not drift_report.table_existed:
+                print("\n🏗️  Step 3: Table missing — creating from BQ schema...")
+                ddl = self.generate_postgres_ddl(schema)
+                self.create_postgres_table(ddl)
+            else:
+                print(f"\n✅ Step 3: Table exists — skipping CREATE ({len(drift_report.added)} columns added, {len(drift_report.dropped)} policy-handled)")
+
+            # Step 4: Upsert delta rows
+            print("\n📦 Step 4: Upserting data (no truncate)...")
+            active_columns = drift_report.active_bq_columns
+            rows_upserted = self.transfer_data_upsert(
+                batch_size=batch_size,
+                active_columns=active_columns,
+                watermark_col=watermark_col,
+                watermark_value=watermark_value,
+            )
+
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+
+            result = {
+                "success": True,
+                "mode": "safe_upsert",
+                "bq_table": self.bq_table_ref,
+                "pg_table": self.pg_table_name,
+                "rows_upserted": rows_upserted,
+                "columns_active": len(active_columns),
+                "columns_added": len(drift_report.added),
+                "columns_dropped_policy": len(drift_report.dropped),
+                "type_mismatches": len(drift_report.type_mismatches),
+                "duration_seconds": duration,
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "drift_summary": drift_report.summary(),
+            }
+
+            print(f"\n{'='*60}")
+            print(f"✅ Safe migration complete! {rows_upserted} rows upserted in {duration:.2f}s")
+            print(f"{'='*60}\n")
+            return result
+
+        except Exception as e:
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            result = {
+                "success": False,
+                "mode": "safe_upsert",
+                "bq_table": self.bq_table_ref,
+                "pg_table": self.pg_table_name,
+                "error": str(e),
+                "duration_seconds": duration,
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+            }
+            print(f"\n❌ Safe migration failed: {str(e)}")
+            raise
+
+    def transfer_data_upsert(
+        self,
+        batch_size: int = 1000,
+        active_columns: Optional[List[str]] = None,
+        watermark_col: Optional[str] = None,
+        watermark_value: Optional[str] = None,
+    ) -> int:
+        """
+        Fetch rows from BQ (optionally filtered by watermark) and upsert
+        into PG using INSERT ... ON CONFLICT (primary_key) DO UPDATE.
+
+        Only columns present in `active_columns` are synced — so schema
+        drift (extra/missing columns) is handled gracefully.
+        """
+        try:
+            total_start = time.perf_counter()
+            client = self._get_bq_client()
+
+            # Full BQ schema for type conversion info
+            bq_table = client.get_table(self.bq_table_ref)
+            full_schema = bq_table.schema
+
+            # Filter schema to only active columns
+            if active_columns:
+                active_set = set(active_columns)
+                schema = [f for f in full_schema if f.name.lower() in active_set]
+            else:
+                schema = full_schema
+                active_columns = [f.name.lower() for f in schema]
+
+            # Pre-compute field conversion info
+            field_info = [
+                {
+                    "name": f.name,
+                    "name_lower": f.name.lower(),
+                    "type": f.field_type,
+                    "needs_conversion": needs_json_conversion(f.field_type),
+                    "is_binary": is_binary_type(f.field_type),
+                }
+                for f in schema
+            ]
+
+            # Build BQ query — incremental if watermark provided
+            if watermark_col and watermark_value:
+                query = (
+                    f"SELECT {', '.join(f.name for f in schema)} "
+                    f"FROM `{self.bq_table_ref}` "
+                    f"WHERE {watermark_col} > TIMESTAMP('{watermark_value}')"
+                )
+                print(f"📊 Incremental BQ fetch (delta only): {watermark_col} > {watermark_value}")
+            else:
+                cols_str = ", ".join(f.name for f in schema)
+                query = f"SELECT {cols_str} FROM `{self.bq_table_ref}`"
+                print(f"📊 Full BQ fetch ({len(schema)} columns): {self.bq_table_ref}")
+
+            bq_fetch_start = time.perf_counter()
+            query_job = client.query(query)
+            bq_results = list(query_job.result())
+            bq_fetch_time = time.perf_counter() - bq_fetch_start
+            print(f"   ⏱️  BQ fetch: {bq_fetch_time:.2f}s — {len(bq_results)} rows")
+
+            if not bq_results:
+                print("   ℹ️  No rows to upsert (empty delta).")
+                return 0
+
+            columns = [fi["name_lower"] for fi in field_info]
+            column_str = ", ".join(f'"{c}"' for c in columns)
+
+            # Build ON CONFLICT upsert SET clause
+            # Skip primary key in the SET clause
+            set_clause = ", ".join(
+                f'"{c}" = EXCLUDED."{c}"'
+                for c in columns
+                if c != self.primary_key
+            )
+
+            rows_upserted = 0
+            insert_time_total = 0.0
+
+            with self.pg_engine.connect() as conn:
+                batch: List[tuple] = []
+                batch_num = 0
+
+                for row in bq_results:
+                    row_dict = dict(row)
+                    converted = tuple(
+                        self._convert_field_value(
+                            row_dict.get(fi["name"]),
+                            fi["type"],
+                            fi["needs_conversion"],
+                            fi["is_binary"],
+                        )
+                        for fi in field_info
+                    )
+                    batch.append(converted)
+
+                    if len(batch) >= batch_size:
+                        batch_num += 1
+                        t0 = time.perf_counter()
+                        self._upsert_batch(
+                            conn, column_str, columns, set_clause, batch
+                        )
+                        insert_time_total += time.perf_counter() - t0
+                        rows_upserted += len(batch)
+                        print(f"  ✅ Batch {batch_num}: {rows_upserted} rows upserted...")
+                        batch = []
+
+                if batch:
+                    batch_num += 1
+                    t0 = time.perf_counter()
+                    self._upsert_batch(conn, column_str, columns, set_clause, batch)
+                    insert_time_total += time.perf_counter() - t0
+                    rows_upserted += len(batch)
+                    print(f"  ✅ Batch {batch_num} (final): {rows_upserted} rows upserted")
+
+                # conn.connection.commit() — SQLAlchemy 2.x: conn.commit() is a no-op when only
+                # raw psycopg2 cursors were used (no conn.execute() calls registered a transaction)
+                conn.connection.commit()
+
+            total_time = time.perf_counter() - total_start
+            print(f"\n⏱️  Upsert breakdown:")
+            print(f"   BQ fetch: {bq_fetch_time:.2f}s  |  PG upsert: {insert_time_total:.2f}s  |  Total: {total_time:.2f}s")
+            return rows_upserted
+
+        except Exception as e:
+            print(f"❌ Upsert failed: {str(e)}")
+            raise
+
+    def _upsert_batch(
+        self,
+        conn,
+        column_str: str,
+        columns: List[str],
+        set_clause: str,
+        batch: List[tuple],
+        retry_count: int = 0,
+        max_retries: int = 3,
+    ):
+        """INSERT ... ON CONFLICT (pk) DO UPDATE SET ... for a batch of rows."""
+        if not batch:
+            return
+
+        num_cols = len(columns)
+        row_ph = ", ".join(["%s"] * num_cols)
+        all_ph = ", ".join([f"({row_ph})" for _ in batch])
+
+        upsert_sql = (
+            f'INSERT INTO "{self.pg_table_name}" ({column_str}) '
+            f"VALUES {all_ph} "
+            f'ON CONFLICT ("{self.primary_key}") DO UPDATE SET {set_clause}'
+        )
+
+        flat_values = [v for row in batch for v in row]
+
+        try:
+            raw_conn = conn.connection.connection
+            cursor = raw_conn.cursor()
+            cursor.execute(upsert_sql, flat_values)
+            cursor.close()
+        except Exception as e:
+            error_msg = str(e)[:150]
+            is_transient = any(
+                kw in error_msg.lower()
+                for kw in ["connection", "timeout", "temporarily", "unavailable", "recovery", "deadlock"]
+            )
+            if is_transient and retry_count < max_retries:
+                delay = 2 ** retry_count
+                print(f"   ⚠️  Upsert batch transient error (attempt {retry_count + 1}/{max_retries}), retrying in {delay}s...")
+                time.sleep(delay)
+                return self._upsert_batch(conn, column_str, columns, set_clause, batch, retry_count + 1, max_retries)
+            raise
+
+    # ------------------------------------------------------------------
+    # Watermark-based append (no PK required — plain INSERT)
+    # ------------------------------------------------------------------
+
+    def migrate_append(
+        self,
+        batch_size: int = 1000,
+        watermark_col: Optional[str] = None,
+        watermark_value: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Incremental append migration for tables with no primary key:
+          1. CREATE TABLE IF NOT EXISTS from BQ schema (never drops existing rows)
+          2. Fetch only rows WHERE watermark_col > last_watermark
+          3. Plain INSERT — no ON CONFLICT needed
+
+        Safe to run repeatedly — only new rows since the last watermark are added.
+        """
+        print(f"\n{'='*60}")
+        print(f"[APPEND] Migration: {self.bq_table_ref} → {self.pg_table_name}")
+        if watermark_col and watermark_value:
+            print(f"         Incremental: {watermark_col} > {watermark_value}")
+        else:
+            print(f"         No watermark — loading ALL rows (first run)")
+        print(f"{'='*60}\n")
+
+        start_time = datetime.now()
+
+        try:
+            # Step 1: BQ schema
+            print("\U0001f4cb Step 1: Fetching BigQuery schema...")
+            schema = self.get_bq_table_schema()
+            print(f"   Found {len(schema)} columns in BQ")
+
+            # Step 2: Create table only if it doesn't exist (no DROP)
+            print("\n\U0001f3d7\ufe0f  Step 2: Ensuring PostgreSQL table exists...")
+            ddl = self.generate_postgres_ddl(schema)
+            ddl_safe = ddl.replace('CREATE TABLE "', 'CREATE TABLE IF NOT EXISTS "', 1)
+            with self.pg_engine.connect() as conn:
+                conn.execute(text(ddl_safe))
+                conn.commit()
+            print(f"   Table '{self.pg_table_name}' ready (existing rows preserved)")
+
+            # Step 3: Append new rows
+            print("\n\U0001f4e6 Step 3: Appending delta rows...")
+            rows_inserted = self.transfer_data_append(
+                batch_size=batch_size,
+                watermark_col=watermark_col,
+                watermark_value=watermark_value,
+            )
+
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+
+            print(f"\n{'='*60}")
+            print(f"\u2705 Append complete — {rows_inserted:,} new rows added")
+            print(f"   Duration: {duration:.2f}s")
+            print(f"{'='*60}\n")
+
+            return {
+                'success': True,
+                'mode': 'watermark_append',
+                'bq_table': self.bq_table_ref,
+                'pg_table': self.pg_table_name,
+                'rows_upserted': rows_inserted,
+                'rows_transferred': rows_inserted,
+                'columns': len(schema),
+                'duration_seconds': duration,
+                'start_time': start_time.isoformat(),
+                'end_time': end_time.isoformat(),
+            }
+
+        except Exception as e:
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            print(f"\n\u274c Append failed: {str(e)}")
+            return {
+                'success': False,
+                'mode': 'watermark_append',
+                'bq_table': self.bq_table_ref,
+                'pg_table': self.pg_table_name,
+                'error': str(e),
+                'duration_seconds': duration,
+            }
+
+    def transfer_data_append(
+        self,
+        batch_size: int = 1000,
+        watermark_col: Optional[str] = None,
+        watermark_value: Optional[str] = None,
+    ) -> int:
+        """Plain INSERT of delta rows. No ON CONFLICT — for tables without a primary key."""
+        total_start = time.perf_counter()
+        try:
+            client = self._get_bq_client()
+            schema = self.get_bq_table_schema()
+
+            field_info = [
+                {
+                    "name": f.name,
+                    "name_lower": f.name.lower(),
+                    "type": f.field_type,
+                    "needs_conversion": needs_json_conversion(f.field_type),
+                    "is_binary": is_binary_type(f.field_type),
+                }
+                for f in schema
+            ]
+
+            cols_str = ", ".join(f.name for f in schema)
+            if watermark_col and watermark_value:
+                query = (
+                    f"SELECT {cols_str} FROM `{self.bq_table_ref}` "
+                    f"WHERE {watermark_col} > TIMESTAMP('{watermark_value}')"
+                )
+                print(f"\U0001f4ca Incremental BQ fetch: {watermark_col} > {watermark_value}")
+            else:
+                query = f"SELECT {cols_str} FROM `{self.bq_table_ref}`"
+                print(f"\U0001f4ca Full BQ fetch (first run): {self.bq_table_ref}")
+
+            bq_fetch_start = time.perf_counter()
+            bq_results = list(client.query(query).result())
+            bq_fetch_time = time.perf_counter() - bq_fetch_start
+            print(f"   \u23f1\ufe0f  BQ fetch: {bq_fetch_time:.2f}s — {len(bq_results):,} rows")
+
+            if not bq_results:
+                print("   \u2139\ufe0f  No new rows since last watermark.")
+                return 0
+
+            columns = [fi["name_lower"] for fi in field_info]
+            column_str = ", ".join(f'"{c}"' for c in columns)
+            rows_inserted = 0
+            insert_time_total = 0.0
+
+            with self.pg_engine.connect() as conn:
+                batch: List[tuple] = []
+                batch_num = 0
+
+                for row in bq_results:
+                    row_dict = dict(row)
+                    converted = tuple(
+                        self._convert_field_value(
+                            row_dict.get(fi["name"]),
+                            fi["type"],
+                            fi["needs_conversion"],
+                            fi["is_binary"],
+                        )
+                        for fi in field_info
+                    )
+                    batch.append(converted)
+
+                    if len(batch) >= batch_size:
+                        batch_num += 1
+                        t0 = time.perf_counter()
+                        self._insert_batch(conn, column_str, columns, batch, max_retries=3)
+                        insert_time_total += time.perf_counter() - t0
+                        rows_inserted += len(batch)
+                        print(f"  \u2705 Batch {batch_num}: {rows_inserted:,} rows inserted...")
+                        batch = []
+
+                if batch:
+                    batch_num += 1
+                    t0 = time.perf_counter()
+                    self._insert_batch(conn, column_str, columns, batch, max_retries=3)
+                    insert_time_total += time.perf_counter() - t0
+                    rows_inserted += len(batch)
+                    print(f"  \u2705 Batch {batch_num} (final): {rows_inserted:,} rows inserted")
+
+                conn.connection.commit()
+
+            total_time = time.perf_counter() - total_start
+            print(f"\n\u23f1\ufe0f  Append breakdown:")
+            print(f"   BQ fetch: {bq_fetch_time:.2f}s  |  PG insert: {insert_time_total:.2f}s  |  Total: {total_time:.2f}s")
+            return rows_inserted
+
+        except Exception as e:
+            print(f"\u274c Append transfer failed: {str(e)}")
+            raise
+
     def migrate(self, batch_size: int = 1000) -> Dict[str, Any]:
         print(f"\n{'='*60}")
         print(f"Starting migration: {self.bq_table_ref} → {self.pg_table_name}")

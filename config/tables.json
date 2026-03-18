@@ -1,8 +1,19 @@
 {
+  "batch_size": 1000,
+
   "migrations": [
+
     {
-      "bq_table": "seismic-helper-364013.vision_lookup.accounts"
+      "_comment": "primarycontracts — no PK in BQ so safe_upsert cannot be used. watermark_append mode: table is created once, then only rows newer than the last watermark are appended each run. No DROP, no full reload.",
+      "bq_table": "seismic-helper-364013.vision_lookup.primarycontracts",
+      "mode": "watermark_append",
+      "primary_key": null,
+      "watermark_column": "public_display_info_last_updated_on",
+      "schema_drift": {
+        "removed_policy": "keep"
+      }
     }
-  ],
-  "batch_size": 1000
+
+  ]
 }
+
