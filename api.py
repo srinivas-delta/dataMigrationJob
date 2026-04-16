@@ -38,6 +38,7 @@ from sqlalchemy import create_engine
 
 from src.bq_to_postgres_migrator import BQToPostgresMigrator
 from src.config_loader import ConfigLoader
+from src.config_table import ConfigTableManager
 from src.watermark_store import WatermarkStore
 from src.logger import get_logger
 
@@ -55,6 +56,8 @@ class AppState:
     migration_configs: List[Dict[str, Any]] = []
     # Short-name → full config mapping, e.g. {"accounts": {...}}
     table_index: Dict[str, Dict[str, Any]] = {}
+    # Global batch_size from config (None = load all at once)
+    batch_size: Optional[int] = None
     # Per-table lock to prevent concurrent syncs of the same table
     _locks: Dict[str, threading.Lock] = {}
 
@@ -89,10 +92,12 @@ async def lifespan(app: FastAPI):
     store = WatermarkStore(engine)
     store.ensure_tables()  # CREATE IF NOT EXISTS — idempotent
 
-    # Load tables config
-    config_path = Path(__file__).parent / "config" / "tables.json"
-    config = ConfigLoader.load_config_file(str(config_path))
+    # Load tables config from database
+    config_mgr = ConfigTableManager(pg_conn_str)
+    config_mgr.ensure_table_exists()
+    config = config_mgr.load_configs()
     migration_configs = config.get("migrations", [])
+    global_batch_size = config.get("batch_size")  # None if not specified
 
     # Build short-name index
     table_index = {}
@@ -105,6 +110,7 @@ async def lifespan(app: FastAPI):
     AppState.watermark_store = store
     AppState.migration_configs = migration_configs
     AppState.table_index = table_index
+    AppState.batch_size = global_batch_size
 
     log.info("API ready — %d table(s) configured.", len(migration_configs))
     yield
@@ -161,6 +167,8 @@ def _run_sync(
     watermark_col = table_cfg.get("watermark_column")
     drift_cfg = table_cfg.get("schema_drift", {})
     removed_policy = drift_cfg.get("removed_policy", "keep")
+    # Use per-table batch_size if specified, else global, else None (load all at once)
+    batch_size = table_cfg.get("batch_size", AppState.batch_size)
 
     lock = AppState.get_lock(short_name)
 
@@ -194,18 +202,21 @@ def _run_sync(
         # Run sync
         if mode == "safe_upsert" and not force_full:
             result = migrator.migrate_safe(
-                batch_size=1000,
+                batch_size=batch_size,
                 watermark_col=watermark_col,
                 watermark_value=watermark_value,
             )
         elif mode == "watermark_append" and not force_full:
             result = migrator.migrate_append(
-                batch_size=1000,
+                batch_size=batch_size,
                 watermark_col=watermark_col,
                 watermark_value=watermark_value,
             )
+        elif mode == "atomic_swap":
+            # Full reload with atomic table swap — no PK/watermark needed
+            result = migrator.migrate_atomic_swap(batch_size=batch_size)
         else:
-            result = migrator.migrate(batch_size=1000)
+            result = migrator.migrate(batch_size=batch_size)
 
         # Advance watermark on success
         finished_at = datetime.now(timezone.utc)

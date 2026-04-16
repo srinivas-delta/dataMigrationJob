@@ -2,6 +2,27 @@
 
 A production-grade, live-safe sync engine that incrementally migrates tables from **Google BigQuery** to **PostgreSQL** with zero downtime, automatic schema drift handling, watermark tracking, and a REST API for on-demand triggers.
 
+## Quick Start
+
+```bash
+# Seed database config from JSON file (one-time)
+python main.py --seed-from-json config/tables.json
+
+# List all configurations
+python main.py --list-configs
+
+# Run all migrations
+python main.py
+
+# Run with parallel workers
+python main.py --parallel 4
+
+# Manage configs
+python manage_configs.py list
+python manage_configs.py add --bq-table project.dataset.table --mode atomic_swap
+python manage_configs.py disable project.dataset.table
+``` 
+
 ---
 
 ## Capabilities at a Glance
@@ -10,7 +31,11 @@ A production-grade, live-safe sync engine that incrementally migrates tables fro
 |---|---|
 | **Live-safe upsert** | `INSERT … ON CONFLICT DO UPDATE` — no truncate, no downtime for live users |
 | **Incremental sync** | Watermark-based delta fetch — only rows changed since last run are pulled from BQ |
+| **Atomic swap** | Zero-downtime full reload — temp table loading + millisecond atomic swap for tables without PK/watermark |
 | **Schema drift detection** | Detects added/removed/type-changed columns every run and applies DDL automatically |
+| **Row count validation** | Post-migration validation — verifies source rows = target rows |
+| **Progress tracking** | Real-time progress with ETA, rows/sec, and percentage complete |
+| **Parallel sync** | Run multiple tables concurrently (`--parallel N`) |
 | **Multi-table** | Any number of tables in one config file, each with independent settings |
 | **REST API** | FastAPI server — trigger syncs via HTTP, check status, view history |
 | **Scheduled execution** | GCP Cloud Scheduler → HTTP POST every 2 hours (or any cron) |
@@ -34,6 +59,9 @@ dataMigrationJob/
 └── src/
     ├── bq_to_postgres_migrator.py  # Core: migrate(), migrate_safe(), upsert logic
     ├── schema_drift_handler.py     # Detects & applies schema changes before each sync
+    ├── validation.py               # Post-migration validation (row count)
+    ├── progress_tracker.py         # Real-time progress tracking
+    ├── parallel_sync.py            # Concurrent table migrations
     ├── watermark_store.py          # sync_watermarks + sync_logs table management
     ├── config_loader.py            # Loads .env, GCP credentials, Postgres config
     └── type_mappings.py            # BigQuery → PostgreSQL type conversion table
@@ -74,39 +102,52 @@ GCP_SERVICE_ACCOUNT_JSON=/path/to/credentials.json
 SYNC_API_KEY=your-secret-key
 ```
 
-### 3. Configure tables
+### 3. Configure migrations (Database Config Table)
 
-Edit `config/tables.json` — add one object per table:
+Migrations are now stored in PostgreSQL, **not** in JSON files. This allows dynamic management without redeployment.
 
-```json
-{
-  "batch_size": 1000,
-  "migrations": [
-    {
-      "bq_table": "project.dataset.accounts",
-      "mode": "safe_upsert",
-      "primary_key": "id",
-      "watermark_column": "updated_at",
-      "schema_drift": { "removed_policy": "keep" }
-    },
-    {
-      "bq_table": "project.dataset.countries",
-      "mode": "safe_upsert",
-      "primary_key": "country_code",
-      "watermark_column": null,
-      "schema_drift": { "removed_policy": "drop" }
-    }
-  ]
-}
+**First time setup — seed from JSON:**
+
+```bash
+python main.py --seed-from-json config/tables.json
 ```
+
+This creates `migration_configs` table and imports all migrations.
+
+**View current configurations:**
+
+```bash
+python main.py --list-configs
+```
+
+**Add a new migration dynamically:**
+
+```bash
+python manage_configs.py add \
+  --bq-table project.dataset.accounts \
+  --mode safe_upsert \
+  --primary-key id \
+  --watermark-column updated_at
+```
+
+**Disable a migration (without deleting):**
+
+```bash
+python manage_configs.py disable project.dataset.accounts
+```
+
+[📖 Full config management guide](CONFIG_DB.md)
 
 ### 4a. Run via CLI
 
 ```bash
-python main.py                              # all tables from config
+python main.py                      # run all enabled migrations from database config  
 python main.py --table project.dataset.t   # single table override
-python main.py --batch-size 500            # custom batch size
-python main.py --config config/prod.json   # alternate config file
+python main.py --batch-size 500            # custom batch size (default: None = load all at once)
+python main.py --parallel 4                # run 4 tables concurrently
+python main.py --no-validate               # skip post-migration validation
+python main.py --no-progress               # disable progress bars
+python main.py --list-configs              # view all configs from database
 ```
 
 ### 4b. Run via API server
@@ -154,6 +195,37 @@ Drops the PG table and reloads everything from BQ. Use only for non-live referen
 }
 ```
 
+### `mode: atomic_swap` — Zero-downtime full reload (no PK, no watermark)
+
+For tables that have **no primary key** and **no watermark column**, this mode provides a safe full reload with zero downtime:
+
+1. Creates a temp table (`tablename_tmp`) with the BQ schema
+2. Loads ALL data from BigQuery into the temp table
+3. **Atomic swap** in a single transaction (~milliseconds):
+   - `DROP TABLE main_table CASCADE`
+   - `RENAME TABLE temp_table TO main_table`
+
+**Benefits:**
+- Old table serves live queries while new data loads
+- Switch happens in milliseconds (single PostgreSQL transaction)
+- If load fails, main table is untouched
+- No duplicate/stale row issues — always a clean slate
+
+```json
+{
+  "bq_table": "project.dataset.reference_data",
+  "mode": "atomic_swap",
+  "primary_key": null,
+  "watermark_column": null
+}
+```
+
+**When to use:**
+- Tables without a primary key that can't use `safe_upsert`
+- Tables without a timestamp/watermark column that can't use `watermark_append`
+- Reference/lookup tables that need periodic full refreshes
+- When you want guaranteed consistency (no partial updates)
+
 ---
 
 ## Schema Drift Handling
@@ -175,13 +247,66 @@ Before every sync the `SchemaDriftHandler` compares the live BQ schema against t
 | `"nullify"` | `UPDATE … SET col = NULL` — marks stale without removing |
 | `"drop"` | `ALTER TABLE DROP COLUMN` — permanent removal |
 
-Set per table in `config/tables.json`:
+Set per table in database config:
 
 ```json
 "schema_drift": { "removed_policy": "keep" }
 ```
 
 ---
+
+## Data Validation
+
+Post-migration validation runs automatically (unless `--no-validate` is specified) to ensure data integrity:
+
+### Row Count Validation
+Compares total row counts between BigQuery source and PostgreSQL target:
+```
+✅ PASS [row_count] BQ=125,432 vs PG=125,432
+```
+
+### Validation Report
+After each migration:
+```
+============================================================
+Validation Report: primarycontracts
+============================================================
+  ✅ PASS [row_count] BQ=125,432 vs PG=125,432
+
+✅ ALL CHECKS PASSED
+============================================================
+```
+
+Disable validation with `--no-validate` if you need faster syncs for trusted data.
+
+---
+
+## Parallel Sync
+
+Run multiple table migrations concurrently for faster bulk migrations:
+
+```bash
+python main.py --parallel 4   # Run 4 tables at a time
+```
+
+### How it works
+- Tables are distributed across N worker threads
+- Each table migration runs independently
+- Results are collected and logged to `sync_logs`
+- Progress bars are disabled in parallel mode
+
+### When to use
+- Multiple small-to-medium tables that can benefit from concurrent I/O
+- Initial data load of many tables
+- Scheduled batch refreshes
+
+### Thread count recommendations
+| Tables | Recommended `--parallel` |
+|--------|-------------------------|
+| 2-4    | 2 |
+| 5-10   | 4 |
+| 10+    | 4-8 (depending on DB connections) |
+
 
 ## REST API
 
@@ -284,59 +409,56 @@ Cloud Scheduler free tier covers 3 jobs — no extra cost.
 
 ## Multi-Table Configuration Reference
 
-```json
-{
-  "batch_size": 1000,
-  "migrations": [
+Configurations are now stored in the `migration_configs` PostgreSQL table. Here are examples of how to add different migration types:
 
-    {
-      "_comment": "Incremental upsert — only changed rows fetched",
-      "bq_table": "project.dataset.accounts",
-      "mode": "safe_upsert",
-      "primary_key": "id",
-      "watermark_column": "updated_at",
-      "schema_drift": { "removed_policy": "keep" }
-    },
+### Example 1: Incremental upsert with watermark
 
-    {
-      "_comment": "Composite key table",
-      "bq_table": "project.dataset.campaigns",
-      "mode": "safe_upsert",
-      "primary_key": "campaign_id",
-      "watermark_column": "modified_at",
-      "schema_drift": { "removed_policy": "keep" }
-    },
-
-    {
-      "_comment": "Stale columns nullified instead of kept",
-      "bq_table": "project.dataset.users",
-      "mode": "safe_upsert",
-      "primary_key": "user_id",
-      "watermark_column": "last_updated",
-      "schema_drift": { "removed_policy": "nullify" }
-    },
-
-    {
-      "_comment": "Small lookup table — full fetch every run, no watermark",
-      "bq_table": "project.dataset.countries",
-      "mode": "safe_upsert",
-      "primary_key": "country_code",
-      "watermark_column": null,
-      "schema_drift": { "removed_policy": "drop" }
-    },
-
-    {
-      "_comment": "Archive table — full drop-reload (not live)",
-      "bq_table": "project.dataset.audit_archive",
-      "mode": "full",
-      "primary_key": "id",
-      "watermark_column": null,
-      "schema_drift": { "removed_policy": "keep" }
-    }
-
-  ]
-}
+```bash
+python manage_configs.py add \
+  --bq-table project.dataset.accounts \
+  --mode safe_upsert \
+  --primary-key id \
+  --watermark-column updated_at \
+  --description "Incremental upsert — only changed rows fetched"
 ```
+
+### Example 2: Full reload with atomic swap
+
+```bash
+python manage_configs.py add \
+  --bq-table project.dataset.reference_data \
+  --mode atomic_swap \
+  --description "Full reload with atomic table swap (no downtime)"
+```
+
+### Example 3: Full table refresh (legacy archive)
+
+```bash
+python manage_configs.py add \
+  --bq-table project.dataset.audit_archive \
+  --mode full \
+  --description "Archive table — full drop-reload"
+```
+
+### Example 4: Lookup table with nullified stale columns
+
+```bash
+python manage_configs.py add \
+  --bq-table project.dataset.countries \
+  --mode safe_upsert \
+  --primary-key country_code \
+  --description "Lookup table with nullified removed columns"
+```
+
+Then update the schema_drift policy via SQL:
+
+```sql
+UPDATE migration_configs
+SET schema_drift = '{"removed_policy": "nullify"}'::jsonb
+WHERE bq_table = 'project.dataset.countries';
+```
+
+[📖 Full configuration guide](CONFIG_DB.md)
 
 ---
 

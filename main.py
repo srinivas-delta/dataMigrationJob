@@ -10,6 +10,7 @@ Usage:
     python main.py --config config/tables.json
     python main.py --table project.dataset.table
     python main.py --batch-size 500
+    python main.py --parallel 4             # Run 4 tables in parallel
 """
 
 import sys
@@ -26,8 +27,10 @@ if sys.platform == 'win32':
 
 from sqlalchemy import create_engine
 from src.config_loader import ConfigLoader
+from src.config_table import ConfigTableManager
 from src.bq_to_postgres_migrator import BQToPostgresMigrator
 from src.watermark_store import WatermarkStore
+from src.parallel_sync import sync_tables_parallel
 from src.logger import get_logger, log_run_summary
 
 
@@ -63,7 +66,7 @@ def main():
         '--config',
         type=str,
         default='config/tables.json',
-        help='Path to config file with tables to migrate (default: config/tables.json)'
+        help='DEPRECATED: Path to config file (use database config table instead)'
     )
     parser.add_argument(
         '--table',
@@ -73,19 +76,41 @@ def main():
     parser.add_argument(
         '--batch-size',
         type=int,
-        default=1000,
-        help='Batch size for data transfer (default: 1000)'
+        default=None,
+        help='Batch size for data transfer (default: None = load all at once)'
+    )
+    parser.add_argument(
+        '--parallel',
+        type=int,
+        metavar='N',
+        help='Run N tables in parallel (default: sequential)'
+    )
+    parser.add_argument(
+        '--no-validate',
+        action='store_true',
+        help='Skip post-migration validation (row count)'
+    )
+    parser.add_argument(
+        '--no-progress',
+        action='store_true',
+        help='Disable progress bars'
+    )
+    parser.add_argument(
+        '--seed-from-json',
+        type=str,
+        metavar='JSON_FILE',
+        help='Seed migration configs from JSON file into database config table'
+    )
+    parser.add_argument(
+        '--list-configs',
+        action='store_true',
+        help='List all migration configurations from database'
     )
     
     args = parser.parse_args()
     
-    log.info("=" * 60)
-    log.info("BigQuery → PostgreSQL Migration Job started at %s",
-             datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-    log.info("=" * 60)
-    
+    # Load credentials and config first (for seed/list operations)
     try:
-        # Load credentials and config
         log.info("Loading GCP credentials...")
         gcp_credentials = ConfigLoader.load_gcp_credentials()
 
@@ -93,26 +118,49 @@ def main():
         pg_config = ConfigLoader.load_postgres_config()
         pg_connection_string = ConfigLoader.build_postgres_connection_string(pg_config)
         log.info("  Host: %s:%s  DB: %s", pg_config['host'], pg_config['port'], pg_config['name'])
-
+    except Exception as e:
+        print(f"❌ Failed to load credentials: {str(e)}")
+        sys.exit(1)
+    
+    # Initialize config table manager
+    config_mgr = ConfigTableManager(pg_connection_string)
+    config_mgr.ensure_table_exists()
+    
+    # Handle special commands
+    if args.seed_from_json:
+        # Seed database config table from JSON file
+        ConfigTableManager.seed_from_json(pg_connection_string, args.seed_from_json)
+        print("\n✅ Config table seeded successfully")
+        sys.exit(0)
+    
+    if args.list_configs:
+        # List all configurations
+        config_mgr.list_configs()
+        sys.exit(0)
+    
+    
+    log.info("=" * 60)
+    log.info("BigQuery → PostgreSQL Migration Job started at %s",
+             datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    log.info("=" * 60)
+    
+    try:
         # Bootstrap watermark store (auto-creates sync_watermarks + sync_logs)
         pg_engine = create_engine(pg_connection_string, pool_pre_ping=True)
         store = WatermarkStore(pg_engine)
         store.ensure_tables()
         log.info("Sync log tables ready (sync_watermarks, sync_logs)")
 
-        # Load migration configs
+        # Load migration configs from database table
         if args.table:
             migration_configs = [{'bq_table': args.table}]
             print(f"\n📋 Single table mode: {args.table}")
         else:
-            if not Path(args.config).exists():
-                print(f"❌ Config file not found: {args.config}")
-                print(f"   Create {args.config} or use --table parameter")
-                sys.exit(1)
-
-            config = ConfigLoader.load_config_file(args.config)
+            # Load from database config table
+            config = config_mgr.load_configs()
             migration_configs = config.get('migrations', [])
-            args.batch_size = config.get('batch_size', args.batch_size)
+            if config.get('batch_size'):
+                args.batch_size = config.get('batch_size', args.batch_size)
 
         if not migration_configs:
             log.error("No tables to migrate — exiting.")
@@ -122,7 +170,45 @@ def main():
         for item in migration_configs:
             log.info("  - %s  [mode=%s]", item['bq_table'], item.get('mode', 'full'))
 
-        # Perform migrations
+        # ---------- PARALLEL MODE ----------
+        if args.parallel and args.parallel > 1 and len(migration_configs) > 1:
+            log.info("Running in PARALLEL mode with %d workers", args.parallel)
+            
+            summary = sync_tables_parallel(
+                table_configs=migration_configs,
+                gcp_credentials=gcp_credentials,
+                pg_connection_string=pg_connection_string,
+                max_workers=args.parallel,
+                batch_size=args.batch_size,
+                watermark_store=store,
+            )
+            
+            # Log results to sync_logs
+            for r in summary.results:
+                log_id = store.log_start(r.table_name, r.result.get('bq_table', '') if r.result else '')
+                if r.success:
+                    store.log_finish(
+                        log_id,
+                        status='success',
+                        rows_affected=r.rows,
+                        duration_secs=r.duration_secs,
+                    )
+                else:
+                    store.log_finish(
+                        log_id,
+                        status='failed',
+                        duration_secs=r.duration_secs,
+                        error=r.error,
+                    )
+            
+            # Summary
+            log_run_summary(log, [r.result or {'success': False, 'error': r.error} for r in summary.results], triggered_by="cli-parallel")
+            
+            if summary.failed > 0:
+                sys.exit(1)
+            sys.exit(0)
+
+        # ---------- SEQUENTIAL MODE ----------
         results = []
         migration_configs = migration_configs if not args.table else [{'bq_table': args.table}]
 
@@ -148,6 +234,8 @@ def main():
                     pg_connection_string=pg_connection_string,
                     primary_key=primary_key,
                     removed_policy=removed_policy,
+                    validate=not args.no_validate,
+                    show_progress=not args.no_progress,
                 )
 
                 if mode == 'safe_upsert':
@@ -164,6 +252,9 @@ def main():
                         watermark_col=watermark_col,
                         watermark_value=watermark_value,
                     )
+                elif mode == 'atomic_swap':
+                    # Full reload with atomic table swap — for tables with no PK and no watermark
+                    result = migrator.migrate_atomic_swap(batch_size=args.batch_size)
                 else:
                     result = migrator.migrate(batch_size=args.batch_size)
 
